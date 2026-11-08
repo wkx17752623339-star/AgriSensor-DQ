@@ -42,6 +42,53 @@ def normalize(df):
     df['is_fault']=pd.to_numeric(df['is_fault'],errors='coerce')
     return df.sort_values(['node_id','timestamp']).reset_index(drop=True)
 
+def adaptive_profile(g, window=11, threshold=3.0, slot_hours=2, min_slot_samples=8):
+    """Causal, node-local robust baseline with time-of-day seasonal fallback.
+
+    Slot baseline uses only previous calendar days within the same time-of-day
+    bucket. When history is insufficient, use a strictly past rolling median.
+    No future samples or target sample enter the baseline. The returned
+    thresholds are descriptive evidence, not calibrated probabilities.
+    """
+    x = pd.to_numeric(g['temperature'], errors='coerce').reset_index(drop=True)
+    t = pd.to_datetime(g['timestamp']).reset_index(drop=True)
+    w = max(11, int(window) * 3)
+    history = x.shift(1)
+    roll_center = history.rolling(w, min_periods=max(8, w//2)).median()
+    roll_mad = (history - roll_center).abs().rolling(w, min_periods=max(8, w//2)).median()
+    # Prior days, matching local time-of-day slot; at least 8 valid samples.
+    bucket = (t.dt.hour * 60 + t.dt.minute) // (max(1, int(slot_hours)) * 60)
+    day = t.dt.normalize()
+    slot_center = pd.Series(np.nan, index=x.index, dtype=float)
+    slot_mad = pd.Series(np.nan, index=x.index, dtype=float)
+    # Compute once per (time slot, calendar day), not once per record.
+    # Prior-day-only history preserves causal behavior and handles irregular sampling.
+    valid = x.notna()
+    groups = pd.DataFrame({'bucket': bucket, 'day': day, 'value': x})
+    for _, slot in groups.groupby('bucket', sort=False):
+        history_values = []
+        for _, today in slot.groupby('day', sort=True):
+            if len(history_values) >= min_slot_samples:
+                values = np.asarray(history_values, dtype=float)
+                median = float(np.median(values))
+                deviation = float(np.median(np.abs(values - median)))
+                slot_center.iloc[today.index] = median
+                slot_mad.iloc[today.index] = deviation
+            current = today.loc[today['value'].notna(), 'value'].to_numpy(dtype=float)
+            history_values.extend(current.tolist())
+    center = slot_center.combine_first(roll_center)
+    mad = slot_mad.combine_first(roll_mad)
+    sigma = (1.4826 * mad).clip(lower=.25)
+    upper = center + float(threshold)*sigma
+    lower = center - float(threshold)*sigma
+    flag = ((x < lower) | (x > upper)).fillna(False)
+    return pd.DataFrame({'adaptive_baseline':center.to_numpy(),
+                         'adaptive_sigma':sigma.to_numpy(),
+                         'adaptive_lower':lower.to_numpy(),
+                         'adaptive_upper':upper.to_numpy(),
+                         'adaptive_flag':flag.to_numpy(),
+                         'baseline_type':np.where(slot_center.notna(),'历史同时段','历史滚动')},index=g.index)
+
 def detect(df, method='Hampel', window=11, threshold=3.0, contamination=.08):
     df=normalize(df); results=[]
     for _,g in df.groupby('node_id',sort=False):
@@ -53,6 +100,45 @@ def detect(df, method='Hampel', window=11, threshold=3.0, contamination=.08):
             mad=(x-med).abs().rolling(window,center=True,min_periods=max(3,window//3)).median()
             scale=(1.4826*mad).clip(lower=.15)
             flag=((x-med).abs()>threshold*scale).fillna(False)
+        elif method=='卡死检测':
+            # Exact repeated readings are suspicious only after a configurable run.
+            # NaNs are handled separately as missing values.
+            run = x.ne(x.shift()).cumsum()
+            count = x.groupby(run).transform('size')
+            flag = x.notna() & count.ge(max(3, int(window)))
+        elif method=='漂移检测':
+            # A sustained, monotonic residual slope relative to a longer baseline.
+            # Rolling linear regression removes the need for supervised training.
+            w = max(7, int(window) | 1)
+            baseline = x.rolling(max(w*4, 29), min_periods=w).median().shift(1)
+            residual = x - baseline
+            # Closed-form rolling OLS slope using rolling sums (no Python callback
+            # and no repeated np.polyfit calls). Complete finite windows only.
+            positions = pd.Series(np.arange(len(residual), dtype=float), index=residual.index)
+            clean = residual.replace([np.inf, -np.inf], np.nan)
+            sum_y = clean.rolling(w, min_periods=w).sum()
+            sum_ty = (clean * positions).rolling(w, min_periods=w).sum()
+            sum_x = w * (w - 1) / 2.0
+            denominator = w * (w * w - 1) / 12.0
+            slopes = (sum_ty - (positions - w + 1) * sum_y - sum_x * sum_y / w) / denominator
+            # threshold is the minimum change in degrees across one window.
+            flag=(slopes.abs()*(w-1)>max(.2,float(threshold))) & residual.abs().gt(max(.3,float(threshold)))
+            flag=flag.fillna(False)
+        elif method=='场景自适应':
+            profile=adaptive_profile(g,window=window,threshold=threshold)
+            for col in ('adaptive_baseline','adaptive_sigma','adaptive_lower','adaptive_upper','baseline_type'):
+                g[col]=profile[col]
+            limits=((x<5)|(x>40)|(g['humidity']<10)|(g['humidity']>95)).fillna(False)
+            flag=profile['adaptive_flag'] | limits
+        elif method=='综合检测':
+            # Preserve independent diagnostic types rather than fitting on injected labels.
+            adaptive=detect(g,method='场景自适应',window=window,threshold=threshold)['detected_fault'].astype(bool)
+            spike=detect(g,method='Hampel',window=window,threshold=threshold)['detected_fault'].astype(bool)
+            stuck=detect(g,method='卡死检测',window=window)['detected_fault'].astype(bool)
+            drift=detect(g,method='漂移检测',window=window,threshold=threshold)['detected_fault'].astype(bool)
+            limits=((x<5)|(x>40)|(g['humidity']<10)|(g['humidity']>95)).fillna(False)
+            flag=spike.to_numpy()|stuck.to_numpy()|drift.to_numpy()|adaptive.to_numpy()|limits.to_numpy()
+            flag=pd.Series(flag,index=g.index)
         elif method=='Isolation Forest':
             features=g[['temperature','humidity','rssi']].copy().ffill().bfill()
             if features.isna().all().any() or len(features)<8:flag=pd.Series(False,index=g.index)
@@ -62,6 +148,15 @@ def detect(df, method='Hampel', window=11, threshold=3.0, contamination=.08):
         else:raise ValueError('未知算法')
         g['detected_fault']=(flag|missing).astype(int)
         g['diagnosis']=np.where(missing,'数据缺失',np.where(flag,'疑似异常','正常'))
+        if method=='场景自适应':
+            g['diagnostic_evidence']=np.where(missing,'温湿度缺失',
+                np.where(flag,'超出历史动态阈值或物理边界','处于历史动态阈值范围内'))
+        elif method=='卡死检测':
+            g['diagnostic_evidence']=np.where(flag,'连续重复读数达到窗口长度','未达到连续重复阈值')
+        elif method=='漂移检测':
+            g['diagnostic_evidence']=np.where(flag,'历史基线残差出现持续趋势','未检出持续趋势')
+        else:
+            g['diagnostic_evidence']=np.where(flag,'当前方法判定异常','当前方法未检出异常')
         results.append(g)
     return pd.concat(results).sort_values(['node_id','timestamp']).reset_index(drop=True)
 

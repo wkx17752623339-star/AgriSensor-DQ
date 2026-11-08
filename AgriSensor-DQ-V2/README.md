@@ -33,3 +33,12 @@
 原启动方式保持不变。首次打开数据管理页会创建 SQLite 数据集及实验记录表。
 故障注入不再为无标签真实数据伪造完整真值；已有标注数据可继续评价。
 数据集存储于 data/datasets，实验索引在 data/agrisensor.db；请定期备份 data 目录。
+
+
+## V4.2 数据管理与视觉升级
+
+- 本地模式：`AGRISENSOR_CLOUD_DEMO=0`，支持多数据集持久保存、选择、删除、完整ZIP备份及恢复。数据位于 `data/agrisensor.db` 与 `data/datasets/`，均不应提交到Git。
+- 云端模式（默认）：`AGRISENSOR_CLOUD_DEMO=1`，上传数据仅在访客当前会话中使用，支持下载当前CSV；重启、重新部署后不保证保留。
+- 本地Windows PowerShell运行：`$env:AGRISENSOR_CLOUD_DEMO='0'; python -m streamlit run app.py`。
+- 如需跨电脑迁移本地历史数据集，请在“数据管理 → 数据集仓库”下载ZIP备份，在新环境使用恢复功能。
+- UI：科研蓝/农业青绿主题，放大功能标题、导航、指标和图标；保留V4.1性能缓存和研究算法。
